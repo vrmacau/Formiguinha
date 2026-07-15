@@ -1,9 +1,367 @@
 <!DOCTYPE html>
-<html lang="pt-BR">
-<head>
+<!-- saved from url=(0012)about:srcdoc -->
+<html lang="pt-BR"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures (htmlToImage undefined) and toPng errors
+            // so the parent always gets a response instead of hanging forever.
+            try {
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
 
 <!-- Google tag (gtag.js) -->
-<script async src="https://www.googletagmanager.com/gtag/js?id=AW-18310859874"></script>
+<script async="" src="https://www.googletagmanager.com/gtag/js?id=AW-18310859874"></script>
 <script>
   window.dataLayer = window.dataLayer || [];
   function gtag(){dataLayer.push(arguments);}
@@ -12,7 +370,7 @@
   gtag('config', 'AW-18310859874');
 </script>
 
-<meta charset="UTF-8">
+
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Formiguinha Market — Mini Mercado Autônomo 24h</title>
 <style>
@@ -320,19 +678,19 @@
   }
 </style>
 </head>
-<body>
+<body id="artifacts-component-root-html">
 
 <!-- NAV -->
 <nav>
   <div class="nav-brand">🐜 Formiguinha <em>Market</em></div>
   <ul class="nav-links">
-    <li><a href="#como-funciona">Como funciona</a></li>
-    <li><a href="#segmentos">Para você</a></li>
-    <li><a href="#simulador">Simule</a></li>
-    <li><a href="#planos">Planos</a></li>
-    <li><a href="#faq">FAQ</a></li>
+    <li><a href="https://www.claudeusercontent.com/artifact/aa98ad1b-334b-4916-a900-f6b1f61c66d0?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#como-funciona">Como funciona</a></li>
+    <li><a href="https://www.claudeusercontent.com/artifact/aa98ad1b-334b-4916-a900-f6b1f61c66d0?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#segmentos">Para você</a></li>
+    <li><a href="https://www.claudeusercontent.com/artifact/aa98ad1b-334b-4916-a900-f6b1f61c66d0?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#simulador">Simule</a></li>
+    <li><a href="https://www.claudeusercontent.com/artifact/aa98ad1b-334b-4916-a900-f6b1f61c66d0?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#planos">Planos</a></li>
+    <li><a href="https://www.claudeusercontent.com/artifact/aa98ad1b-334b-4916-a900-f6b1f61c66d0?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#faq">FAQ</a></li>
   </ul>
-  <a href="#" onclick="abrirModal(event,'nav')" class="nav-cta">Quero ser franqueado</a>
+  <a href="https://www.claudeusercontent.com/artifact/aa98ad1b-334b-4916-a900-f6b1f61c66d0?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#" onclick="abrirModal(event,&#39;nav&#39;)" class="nav-cta">Quero ser franqueado</a>
 </nav>
 
 <!-- HERO -->
@@ -342,8 +700,8 @@
     <h1>Fature enquanto<br>você <span>dorme</span></h1>
     <p class="hero-sub">Instale um mini mercado completo no seu Airbnb ou condomínio — sem funcionários, sem horário fixo. Vendas automáticas 24 horas.</p>
     <div class="hero-btns">
-      <a href="#" onclick="abrirModal(event,'hero')" class="btn-gold">📲 Quero começar agora</a>
-      <a href="#como-funciona" class="btn-ghost">Como funciona →</a>
+      <a href="https://www.claudeusercontent.com/artifact/aa98ad1b-334b-4916-a900-f6b1f61c66d0?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#" onclick="abrirModal(event,&#39;hero&#39;)" class="btn-gold">📲 Quero começar agora</a>
+      <a href="https://www.claudeusercontent.com/artifact/aa98ad1b-334b-4916-a900-f6b1f61c66d0?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#como-funciona" class="btn-ghost">Como funciona →</a>
     </div>
     <div class="hero-stats">
       <div class="hero-stat"><div class="n">R$ 20k</div><div class="l">Faturamento médio/mês</div></div>
@@ -361,8 +719,8 @@
     <h2 class="section-title">Do contrato às <span>vendas automáticas</span></h2>
     <p class="section-sub">Em poucos passos você tem um mini mercado operando e gerando renda, sem precisar estar presente.</p>
     <div class="steps-grid">
-      <div class="step-card"><div class="step-n">01</div><h3>Escolha seu plano</h3><p>Franquia com a marca Formiguinha Market ou licença de tecnologia com seu próprio nome. Você decide.</p></div>
-      <div class="step-card"><div class="step-n">02</div><h3>Instalação em 1 dia</h3><p>Instalamos o totem ou leitor de código de barras. Você cadastra os produtos pelo celular em minutos.</p></div>
+      <div class="step-card"><div class="step-n">01</div><h3>Adquira sua franquia Formiguinha Market</h3><p>Franquia com a marca Formiguinha Market ou licença de tecnologia com seu próprio nome. Você decide.</p></div>
+      <div class="step-card"><div class="step-n">02</div><h3>Instalação em 1 dia</h3><p>Através do sistema Kryptopay você cria seu catálogo de vendas em poucos minutos.</p></div>
       <div class="step-card"><div class="step-n">03</div><h3>Hóspede ou morador compra</h3><p>O cliente escaneia o produto, paga por Pix ou cartão e pronto. Sem caixa, sem fila.</p></div>
       <div class="step-card"><div class="step-n">04</div><h3>Você acompanha tudo</h3><p>Dashboard em tempo real no celular: vendas, estoque, relatórios. De onde você estiver.</p></div>
       <div class="step-card"><div class="step-n">05</div><h3>Repõe e lucra</h3><p>Quando o estoque baixa, você recebe alerta e repõe. O dinheiro cai direto na sua conta.</p></div>
@@ -438,14 +796,11 @@
 <section id="planos" class="section how-bg">
   <div class="inner">
     <div class="tag">Investimento</div>
-    <h2 class="section-title">Escolha o seu <span>plano</span></h2>
-    <p class="section-sub">Dois planos pensados para cada segmento — mesmo sistema, mesmo suporte, mesmo preço.</p>
-    <div class="plans-grid">
+    <h2 class="section-title">Seu minimercado Formiguinha Market poderá ser aplicado tanto para seu <span>Airbnb</span> como para seu ponto <span>comercial</span></h2>
+    <div class="plans-grid" style="grid-template-columns: 1fr; max-width: 480px; margin-left: auto; margin-right: auto;">
       <div class="plan featured">
-        <div class="plan-badge">🏠 Para Airbnb</div>
-        <h3>🐜 Formiguinha Market Airbnb</h3>
-        <div class="price">R$ <span>497,90</span></div>
-        <div class="psub">Kit de Abertura + R$ 29,90/mês da plataforma</div>
+        <div class="plan-badge">🏠 Airbnb &amp; 🏢 Comercial</div>
+        <h3>🐜 Formiguinha Market</h3>
         <ul>
           <li>Sistema de gestão completo</li>
           <li>Leitor de código de barras</li>
@@ -457,25 +812,7 @@
           <li>Sem royalties sobre faturamento</li>
           <li>Suporte técnico mensal</li>
         </ul>
-        <a href="https://go.hotmart.com/D105118986J" target="_blank" class="plan-btn">🛒 Adquirir agora</a>
-      </div>
-      <div class="plan featured">
-        <div class="plan-badge">🏢 Para Condomínio</div>
-        <h3>🐜 Formiguinha Market Comercial</h3>
-        <div class="price">R$ <span>497,90</span></div>
-        <div class="psub">Kit de Abertura + R$ 29,90/mês da plataforma</div>
-        <ul>
-          <li>Sistema de gestão completo</li>
-          <li>Leitor de código de barras</li>
-          <li>Dashboard em tempo real</li>
-          <li>Uso da marca Formiguinha Market</li>
-          <li>Manual operacional completo</li>
-          <li>Treinamento online</li>
-          <li>Material de marketing incluso</li>
-          <li>Sem royalties sobre faturamento</li>
-          <li>Suporte técnico mensal</li>
-        </ul>
-        <a href="https://go.hotmart.com/D105118986J" target="_blank" class="plan-btn">🛒 Adquirir agora</a>
+        <a href="https://go.hotmart.com/D105118986J" target="_blank" class="plan-btn">🛒 Clique aqui e acesse a promoção</a>
       </div>
     </div>
   </div>
@@ -514,27 +851,27 @@
     <h2 class="section-title">Tire suas <span>dúvidas</span></h2>
     <div class="faq-list">
       <div class="faq-item open">
-        <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">Preciso ter funcionário?<span class="icon">+</span></div>
+        <div class="faq-q" onclick="this.parentElement.classList.toggle(&#39;open&#39;)">Preciso ter funcionário?<span class="icon">+</span></div>
         <div class="faq-a">Não. O sistema é 100% autônomo. O cliente escaneia o produto, paga e sai. Você só precisa repor o estoque periodicamente — o app avisa quando está baixo.</div>
       </div>
       <div class="faq-item">
-        <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">Qual é o investimento mínimo?<span class="icon">+</span></div>
+        <div class="faq-q" onclick="this.parentElement.classList.toggle(&#39;open&#39;)">Qual é o investimento mínimo?<span class="icon">+</span></div>
         <div class="faq-a">O investimento inicial inclui a taxa de setup ou franquia mais o primeiro estoque (em torno de R$ 3.000 a R$ 8.000 dependendo do tamanho do ponto). Entre em contato para uma proposta personalizada.</div>
       </div>
       <div class="faq-item">
-        <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">Quais opções de negócio?<span class="icon">+</span></div>
-        <div class="faq-a">Temos dois planos: <strong>Formiguinha Market Airbnb</strong> (para apartamentos de temporada) e <strong>Formiguinha Market Comercial</strong> (para condomínios e prédios). Ambos por R$ 497,90 + R$ 29,90/mês da plataforma, sem royalties sobre faturamento.</div>
+        <div class="faq-q" onclick="this.parentElement.classList.toggle(&#39;open&#39;)">Quais opções de negócio?<span class="icon">+</span></div>
+        <div class="faq-a">O Formiguinha Market é um sistema único que funciona tanto para <strong>Airbnb</strong> (apartamentos de temporada) quanto para uso <strong>Comercial</strong> (condomínios e prédios). Clique em "acesse a promoção" e confira as condições atuais.</div>
       </div>
       <div class="faq-item">
-        <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">Como funciona o controle de estoque?<span class="icon">+</span></div>
+        <div class="faq-q" onclick="this.parentElement.classList.toggle(&#39;open&#39;)">Como funciona o controle de estoque?<span class="icon">+</span></div>
         <div class="faq-a">Cada venda baixa automaticamente do estoque no app. Quando um produto está acabando, você recebe um alerta e pode repor antes de zerar. Tudo pelo celular.</div>
       </div>
       <div class="faq-item">
-        <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">E se o cliente não pagar?<span class="icon">+</span></div>
+        <div class="faq-q" onclick="this.parentElement.classList.toggle(&#39;open&#39;)">E se o cliente não pagar?<span class="icon">+</span></div>
         <div class="faq-a">O pagamento é confirmado antes de o produto ser registrado como vendido. O sistema aceita Pix, cartão de crédito e débito — sem fiado, sem risco.</div>
       </div>
       <div class="faq-item">
-        <div class="faq-q" onclick="this.parentElement.classList.toggle('open')">Em quanto tempo recupero o investimento?<span class="icon">+</span></div>
+        <div class="faq-q" onclick="this.parentElement.classList.toggle(&#39;open&#39;)">Em quanto tempo recupero o investimento?<span class="icon">+</span></div>
         <div class="faq-a">Estimamos payback de 9 a 12 meses para condomínios com 100+ unidades e faturamento médio de R$ 15k–20k/mês com margem líquida de 20%.</div>
       </div>
     </div>
@@ -547,11 +884,11 @@
   <p>Preencha seus dados e nosso consultor entra em contato, ou adquira agora direto pelo link.</p>
   <div style="display:flex;gap:16px;justify-content:center;flex-wrap:wrap;margin-top:8px;">
     <a href="https://go.hotmart.com/D105118986J" target="_blank" class="btn-gold">🛒 Adquirir agora</a>
-    <a href="#" onclick="abrirModal(event,'cta-final')" class="btn-ghost" style="border-color:rgba(255,255,255,.4);color:#fff;padding:16px 36px;border-radius:10px;font-weight:500;font-size:16px;text-decoration:none;">📲 Falar com consultor</a>
+    <a href="https://www.claudeusercontent.com/artifact/aa98ad1b-334b-4916-a900-f6b1f61c66d0?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#" onclick="abrirModal(event,&#39;cta-final&#39;)" class="btn-ghost" style="border-color:rgba(255,255,255,.4);color:#fff;padding:16px 36px;border-radius:10px;font-weight:500;font-size:16px;text-decoration:none;">📲 Falar com consultor</a>
   </div>
 </div>
 
-<footer>© 2025 Formiguinha Market · Todos os direitos reservados · <a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="462029342b2f21332f282e272b27342d233206212b272f2a6825292b">[email&#160;protected]</a></footer>
+<footer>© 2025 Formiguinha Market · Todos os direitos reservados · formiguinhamarket@gmail.com</footer>
 
 <!-- MODAL DE CAPTAÇÃO -->
 <div class="modal-overlay" id="modalOverlay" onclick="fecharModalFora(event)">
@@ -568,11 +905,11 @@
         <div class="modal-row">
           <div class="modal-field">
             <label>Nome completo *</label>
-            <input type="text" id="fNome" placeholder="Seu nome" required>
+            <input type="text" id="fNome" placeholder="Seu nome" required="">
           </div>
           <div class="modal-field">
             <label>Estado *</label>
-            <select id="fEstado" required>
+            <select id="fEstado" required="">
               <option value="">Selecione...</option>
               <option>AC</option><option>AL</option><option>AP</option><option>AM</option>
               <option>BA</option><option>CE</option><option>DF</option><option>ES</option>
@@ -586,7 +923,7 @@
         </div>
         <div class="modal-field">
           <label>Tipo de projeto *</label>
-          <select id="fProjeto" required>
+          <select id="fProjeto" required="">
             <option value="">Selecione seu interesse...</option>
             <option value="Airbnb / Temporada">🏠 Airbnb / Temporada</option>
             <option value="Condomínio / Comercial">🏢 Condomínio / Comercial</option>
@@ -596,11 +933,11 @@
         <div class="modal-row">
           <div class="modal-field">
             <label>E-mail *</label>
-            <input type="email" id="fEmail" placeholder="seu@email.com" required>
+            <input type="email" id="fEmail" placeholder="seu@email.com" required="">
           </div>
           <div class="modal-field">
             <label>WhatsApp *</label>
-            <input type="tel" id="fZap" placeholder="(91) 9 9999-9999" required>
+            <input type="tel" id="fZap" placeholder="(91) 9 9999-9999" required="">
           </div>
         </div>
         <button type="submit" class="modal-submit" id="btnSubmit">
@@ -619,8 +956,8 @@
         🛒 Adquirir agora
       </a>
       <br>
-      <a href="https://wa.me/5591993041001?text=Olá!%20Tenho%20interesse%20na%20Formiguinha%20Market%20e%20gostaria%20de%20mais%20informações." class="wa-btn" target="_blank" style="margin-top:8px;">
-        <svg width="22" height="22" viewBox="0 0 24 24" fill="white"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>
+      <a href="https://wa.me/5591993041001?text=Ol%C3%A1!%20Tenho%20interesse%20na%20Formiguinha%20Market%20e%20gostaria%20de%20mais%20informa%C3%A7%C3%B5es." class="wa-btn" target="_blank" style="margin-top:8px;">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="white"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"></path></svg>
         Tirar dúvidas: (91) 99304-1001
       </a>
     </div>
@@ -628,11 +965,11 @@
 </div>
 
 <!-- WHATSAPP FLOAT -->
-<a href="#" onclick="abrirModal(event,'float')" class="wa" title="WhatsApp">
-  <svg viewBox="0 0 24 24"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z" fill="white"/></svg>
+<a href="https://www.claudeusercontent.com/artifact/aa98ad1b-334b-4916-a900-f6b1f61c66d0?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#" onclick="abrirModal(event,&#39;float&#39;)" class="wa" title="WhatsApp">
+  <svg viewBox="0 0 24 24"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z" fill="white"></path></svg>
 </a>
 
-<script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script>
+<script>
 // ── Simulador ──────────────────────────────────────
 function fmt(n) { return 'R$ ' + Math.round(n).toLocaleString('pt-BR'); }
 function simCalc() {
@@ -708,3 +1045,4 @@ document.getElementById('leadForm').addEventListener('submit', async function(e)
       // Fallback: mesmo sem Formspree configurado, mostra sucesso e abre WA
       document.getElementById('formArea').style.display = 'none';
       document.getElementByI
+</script></body></html>
